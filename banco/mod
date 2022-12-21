@@ -1,0 +1,300 @@
+library(RODBC)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(pROC)
+
+cn_AND<-odbcDriverConnect(connection="Driver={SQL Server Native Client 11.0};
+                                  server=btbdmd00;
+                                  database=BD_DATASCIENCE;
+                                  trusted_connection=yes;")
+Q1<-"SELECT B.FLG_OPERACION,A.*
+FROM BD_DATASCIENCE.mnc.IND_ATM_APR A
+INNER JOIN ##CIC_CULC B
+ON A.CIC=B.CIC AND A.FECHAS_1MA_AM=B.FECHAS_1MA_AM
+WHERE A.FECHAS_1MA_AM BETWEEN '201801' AND '202104'"
+
+Q2<-"SELECT B.FLG_OPERACION,A.*
+  FROM BD_DATASCIENCE.mnc.IND_ATM_APR A
+INNER JOIN ##CIC_CULC B
+ON A.CIC=B.CIC AND A.FECHAS_1MA_AM=B.FECHAS_1MA_AM
+WHERE A.FECHAS_1MA_AM = '202106'"
+
+DF_TRANS_TRAIN_TEST<-sqlQuery(cn_AND,Q1)
+DF_TRANS_OOT<-sqlQuery(cn_AND,Q2)
+odbcClose(cn_AND)
+
+summary(DF_TRANS_TRAIN_TEST)
+lim_1<-function(x){
+  ifelse(x>=99999999999,quantile(na.omit(x),0.85),x)
+}
+
+lim_2<-function(x){
+  ifelse(x>=77777777777,0,x)
+}
+summary(DF_TRANS_TRAIN_TEST[,pasivas])
+pasivas<-colnames(DF_TRANS_TRAIN_TEST %>% select_if(is.numeric))
+
+DF_TRANS_TRAIN_TEST[,pasivas]<-apply(DF_TRANS_TRAIN_TEST[,pasivas],2,lim_1)
+DF_TRANS_TRAIN_TEST[,pasivas]<-apply(DF_TRANS_TRAIN_TEST[,pasivas],2,lim_2)
+
+############# TRAN_1 TO TRAN_ADM
+DF_TRANS_TRAIN_TEST$FLG_OPERACION<-as.factor(DF_TRANS_TRAIN_TEST$FLG_OPERACION)
+
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST[,c(-2,-3)]
+
+i<-NULL
+for (i in 247:336) {
+  DF_TRANS_TRAIN_TEST[,i]<-as.factor(DF_TRANS_TRAIN_TEST[,i])
+}
+
+#######omitiendo las columnas NULL
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST[,-c(197:247)]
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST[,-273]
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST[,-243]
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST[,-213]
+
+
+######MUESTRA Y SUBMUESTREO
+set.seed(1234)
+
+train <- createDataPartition(y = DF_TRANS_TRAIN_TEST$FLG_OPERACION, p = 0.8, list = FALSE, times = 1)
+
+datos_train<- DF_TRANS_TRAIN_TEST[train, ]
+SUB_SAMP_K_1<-function(x,K){
+  s<-x%>%filter(FLG_OPERACION==0)
+  s<-s[sample(nrow(s), K*nrow(x%>%filter(FLG_OPERACION==1))), ]
+  c<-x%>%filter(FLG_OPERACION==1)
+  x<-rbind(s,c)
+  x<-x[sample(nrow(x), nrow(x)), ]
+  return(x)
+}
+
+DATOS_TRAIN_SUB<-SUB_SAMP_K_1(datos_train,1)
+datos_test  <- DF_TRANS_TRAIN_TEST[-train, ]
+
+prop.table(table(DATOS_TRAIN_SUB$FLG_OPERACION))
+prop.table(table(datos_test$FLG_OPERACION))
+
+
+
+####### MODELACION ARBOL DE DECISION
+set.seed(1234)
+mod_for<-randomForest(FLG_OPERACION~.,data=DATOS_TRAIN_SUB)
+
+clase_mod_for<-predict(mod_for,datos_test,type = "class")
+clase_mod_for_prob<-predict(mod_for,datos_test,type = "prob")
+
+dtamodel<-as.data.frame(mod_for$importance)
+dtamodel["nombre"]<-rownames(dtamodel)
+dtamodel<-dtamodel %>% arrange(desc(MeanDecreaseGini))
+dtamodel["pareto"]<-cumsum(dtamodel$MeanDecreaseGini)/sum(dtamodel$MeanDecreaseGini)*100
+dtamodel<-dtamodel %>% filter(pareto<=80)
+
+nombresmodel<-dtamodel$nombre
+nombresmodel[127]<-"FLG_OPERACION"
+x<-round(cor(DF_TRANS_TRAIN_TEST %>% select(nombresmodel[1:30])),2)
+x<-as.data.frame(x)
+
+x_mod<-x>0.80
+
+head(dtamodel %>% select(-"nombre"))
+
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST %>% select(all_of(nombresmodel)) 
+
+
+####SEGUNDA_ITERACION
+set.seed(1234)
+
+datos_train<- DF_TRANS_TRAIN_TEST[train, ]
+DATOS_TRAIN_SUB<-SUB_SAMP_K_1(datos_train,1)
+datos_test  <- DF_TRANS_TRAIN_TEST[-train, ]
+
+set.seed(1234)
+mod_for<-randomForest(FLG_OPERACION~.,data=DATOS_TRAIN_SUB)
+
+dtamodel<-as.data.frame(mod_for$importance)
+dtamodel["nombre"]<-rownames(dtamodel)
+dtamodel<-dtamodel %>% arrange(desc(MeanDecreaseGini))
+dtamodel["pareto"]<-cumsum(dtamodel$MeanDecreaseGini)/sum(dtamodel$MeanDecreaseGini)*100
+dtamodel<-dtamodel %>% filter(pareto<=80)
+
+x<-round(cor(DF_TRANS_TRAIN_TEST %>% select(nombresmodel[1:30])),2)
+x>0.80
+
+nombresmodel<-dtamodel$nombre
+nombresmodel[88]<-"FLG_OPERACION"
+
+#####  TERCERA ITERACION
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST %>% select(all_of(nombresmodel)) 
+
+set.seed(1234)
+
+datos_train<- DF_TRANS_TRAIN_TEST[train, ]
+DATOS_TRAIN_SUB<-SUB_SAMP_K_1(datos_train,1)
+datos_test  <- DF_TRANS_TRAIN_TEST[-train, ]
+
+set.seed(1234)
+mod_for<-randomForest(FLG_OPERACION~.,data=DATOS_TRAIN_SUB)
+
+dtamodel<-as.data.frame(mod_for$importance)
+dtamodel["nombre"]<-rownames(dtamodel)
+dtamodel<-dtamodel %>% arrange(desc(MeanDecreaseGini))
+dtamodel["pareto"]<-cumsum(dtamodel$MeanDecreaseGini)/sum(dtamodel$MeanDecreaseGini)*100
+dtamodel<-dtamodel %>% filter(pareto<=80)
+
+
+
+nombresmodel<-dtamodel$nombre
+nombresmodel[64]<-"FLG_OPERACION"
+
+##########   CUARTA ITERACION
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST %>% select(all_of(nombresmodel)) 
+
+set.seed(1234)
+
+datos_train<- DF_TRANS_TRAIN_TEST[train, ]
+DATOS_TRAIN_SUB<-SUB_SAMP_K_1(datos_train,1)
+datos_test  <- DF_TRANS_TRAIN_TEST[-train, ]
+
+set.seed(1234)
+mod_for<-randomForest(FLG_OPERACION~.,data=DATOS_TRAIN_SUB)
+
+dtamodel<-as.data.frame(mod_for$importance)
+dtamodel["nombre"]<-rownames(dtamodel)
+dtamodel<-dtamodel %>% arrange(desc(MeanDecreaseGini))
+dtamodel["pareto"]<-cumsum(dtamodel$MeanDecreaseGini)/sum(dtamodel$MeanDecreaseGini)*100
+dtamodel<-dtamodel %>% filter(pareto<=80)
+
+
+nombresmodel<-dtamodel$nombre
+nombresmodel[48]<-"FLG_OPERACION"
+
+
+#######QUINTA ITERACION
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST %>% select(all_of(nombresmodel)) 
+
+set.seed(1234)
+
+datos_train<- DF_TRANS_TRAIN_TEST[train, ]
+DATOS_TRAIN_SUB<-SUB_SAMP_K_1(datos_train,1)
+datos_test  <- DF_TRANS_TRAIN_TEST[-train, ]
+
+set.seed(1234)
+mod_for<-randomForest(FLG_OPERACION~.,data=DATOS_TRAIN_SUB)
+
+dtamodel<-as.data.frame(mod_for$importance)
+dtamodel["nombre"]<-rownames(dtamodel)
+dtamodel<-dtamodel %>% arrange(desc(MeanDecreaseGini))
+dtamodel["pareto"]<-cumsum(dtamodel$MeanDecreaseGini)/sum(dtamodel$MeanDecreaseGini)*100
+dtamodel<-dtamodel %>% filter(pareto<=80)
+
+
+
+nombresmodel<-dtamodel$nombre
+nombresmodel[36]<-"FLG_OPERACION"
+
+
+########## 6 ITERACION
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST %>% select(all_of(nombresmodel)) 
+
+set.seed(1234)
+
+datos_train<- DF_TRANS_TRAIN_TEST[train, ]
+DATOS_TRAIN_SUB<-SUB_SAMP_K_1(datos_train,1)
+datos_test  <- DF_TRANS_TRAIN_TEST[-train, ]
+
+set.seed(1234)
+mod_for<-randomForest(FLG_OPERACION~.,data=DATOS_TRAIN_SUB)
+
+dtamodel<-as.data.frame(mod_for$importance)
+dtamodel["nombre"]<-rownames(dtamodel)
+dtamodel<-dtamodel %>% arrange(desc(MeanDecreaseGini))
+dtamodel["pareto"]<-cumsum(dtamodel$MeanDecreaseGini)/sum(dtamodel$MeanDecreaseGini)*100
+dtamodel<-dtamodel %>% filter(pareto<=80)
+
+nombresmodel<-dtamodel$nombre
+nombresmodel[27]<-"FLG_OPERACION"
+
+x<-round(cor(DF_TRANS_TRAIN_TEST %>% select(nombresmodel[1:25])),2)
+
+for (i in 1:27) {
+ print(sum(x[,i]>0.8))    
+} 
+
+nombresmodel<-nombresmodel[c(-1,-2,-3,-8)]
+
+
+########## MODELADO FINAL
+DF_TRANS_TRAIN_TEST<-DF_TRANS_TRAIN_TEST %>% select(all_of(nombresmodel)) 
+
+set.seed(1234)
+
+train <- createDataPartition(y = DF_TRANS_TRAIN_TEST$FLG_OPERACION, p = 0.8, list = FALSE, times = 1)
+datos_train<- DF_TRANS_TRAIN_TEST[train, ]
+DATOS_TRAIN_SUB<-SUB_SAMP_K_1(datos_train,1)
+datos_test  <- DF_TRANS_TRAIN_TEST[-train, ]
+
+set.seed(1234)
+mod_for<-randomForest(FLG_OPERACION~.,data=DATOS_TRAIN_SUB)
+
+
+varImpPlot(mod_for)
+
+clase_mod_for<-predict(mod_for,datos_test,type = "response")
+clase_mod_for_prob<-predict(mod_for,datos_test,type = "vote")
+
+########MATRIZ DE CONFUSION
+
+
+confusionMatrix(datos_test$FLG_OPERACION,clase_mod_for)
+
+######ROC - AUC
+
+rf.roc<-roc(datos_test$FLG_OPERACION,clase_mod_for_prob[,2])
+CORTE_Youden<-rf.roc$thresholds[(which.max(rf.roc$sensitivities+rf.roc$specificities-1))]
+auc_est <- auc(rf.roc)
+auc_est
+ci(rf.roc)
+ggroc(rf.roc) +  
+  geom_abline(intercept = 1, colour = "red", alpha = 0.4, linetype="F1") +ggtitle("")+
+  theme(plot.title = element_text(hjust = 0.5))+labs(subtitle = paste("Area bajo la curva: ",as.character(round(auc_est,3))))
+
+
+########## DATOS OOT
+DF_TRANS_OOT$FLG_OPERACION<-as.factor(DF_TRANS_OOT$FLG_OPERACION)
+DF_TRANS_OOT<-DF_TRANS_OOT[,c(-2,-3)]
+
+for (j in 247:336) {
+  DF_TRANS_OOT[,j]<-as.factor(DF_TRANS_OOT[,j])
+}
+
+
+DF_TRANS_OOT<-DF_TRANS_OOT %>% select(all_of(nombresmodel))
+
+set.seed(1234)
+mod_for<-randomForest(FLG_OPERACION~.,data=DATOS_TRAIN_SUB)
+
+
+varImpPlot(mod_for)
+
+clase_mod_for<-predict(mod_for,DF_TRANS_OOT,type = "response")
+clase_mod_for_prob<-predict(mod_for,DF_TRANS_OOT,type = "vote")
+  
+sum(clase_mod_for==0)
+########MATRIZ DE CONFUSION
+
+
+confusionMatrix(DF_TRANS_OOT$FLG_OPERACION,clase_mod_for)
+
+######ROC - AUC
+
+rf.roc<-roc(DF_TRANS_OOT$FLG_OPERACION,clase_mod_for_prob[,2])
+CORTE_Youden<-rf.roc$thresholds[(which.max(rf.roc$sensitivities+rf.roc$specificities-1))]
+auc_est <- auc(rf.roc)
+auc_est
+ci(rf.roc)
+ggroc(rf.roc) +  
+  geom_abline(intercept = 1, colour = "red", alpha = 0.4, linetype="F1") +ggtitle("")+
+  theme(plot.title = element_text(hjust = 0.5))+labs(subtitle = paste("Area bajo la curva: ",as.character(round(auc_est,3))))
+names(DF_TRANS_TRAIN_TEST)
